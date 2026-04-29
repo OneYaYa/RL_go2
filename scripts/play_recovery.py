@@ -77,10 +77,21 @@ def main():
     print("obs mean:", obs.mean().item())
     print("obs std:",  obs.std().item())
 
-    episode_rewards   = torch.zeros(args.num_envs, device=args.device)
-    episode_lengths   = torch.zeros(args.num_envs, device=args.device)
+    robot = env.unwrapped.scene["robot"]
+
+    SUSTAIN_STEPS = 25       # 0.5 s @ 50 Hz policy rate
+    GZ_THRESH     = -0.9     # projected gravity z: < -0.9 ≈ upright
+    HEIGHT_THRESH = 0.28     # base height (m) for "standing"
+
+    episode_rewards    = torch.zeros(args.num_envs, device=args.device)
+    episode_lengths    = torch.zeros(args.num_envs, device=args.device)
+    upright_streak     = torch.zeros(args.num_envs, device=args.device)
+    time_upright_sum   = torch.zeros(args.num_envs, device=args.device)
     completed_rewards: list[float] = []
     completed_lengths: list[float] = []
+    completed_success:      list[int]   = []   # upright at episode end
+    completed_sustained:    list[int]   = []   # upright for last SUSTAIN_STEPS
+    completed_time_up_frac: list[float] = []   # fraction of episode upright
 
     print(f"\n[play_recovery] Rolling out {args.num_steps} steps "
           f"across {args.num_envs} envs...")
@@ -90,6 +101,15 @@ def main():
             actions                     = policy(obs)
             obs, rewards, dones, extras = env.step(actions)
 
+            gz      = robot.data.projected_gravity_b[:, 2]
+            height  = robot.data.root_pos_w[:, 2]
+            upright = (gz < GZ_THRESH) & (height > HEIGHT_THRESH)
+
+            upright_streak    = torch.where(
+                upright, upright_streak + 1, torch.zeros_like(upright_streak)
+            )
+            time_upright_sum += upright.float()
+
             episode_rewards += rewards
             episode_lengths += 1
 
@@ -97,31 +117,60 @@ def main():
             if done_ids.numel() > 0:
                 completed_rewards.extend(episode_rewards[done_ids].tolist())
                 completed_lengths.extend(episode_lengths[done_ids].tolist())
-                episode_rewards[done_ids] = 0.0
-                episode_lengths[done_ids] = 0.0
+                completed_success.extend(upright[done_ids].long().tolist())
+                completed_sustained.extend(
+                    (upright_streak[done_ids] >= SUSTAIN_STEPS).long().tolist()
+                )
+                completed_time_up_frac.extend(
+                    (time_upright_sum[done_ids] / episode_lengths[done_ids]).tolist()
+                )
+
+                episode_rewards[done_ids]   = 0.0
+                episode_lengths[done_ids]   = 0.0
+                upright_streak[done_ids]    = 0.0
+                time_upright_sum[done_ids]  = 0.0
 
             if (step + 1) % 200 == 0:
-                _print_stats(step + 1, completed_rewards, completed_lengths)
+                _print_stats(step + 1, completed_rewards, completed_lengths,
+                             completed_success, completed_sustained,
+                             completed_time_up_frac)
 
     print("\n── Final Stats ──────────────────────────────────────────")
-    _print_stats(args.num_steps, completed_rewards, completed_lengths)
+    _print_stats(args.num_steps, completed_rewards, completed_lengths,
+                 completed_success, completed_sustained,
+                 completed_time_up_frac)
 
     env.close()
     simulation_app.close()
 
 
-def _print_stats(step: int, rewards: list, lengths: list) -> None:
+def _print_stats(
+    step: int,
+    rewards: list,
+    lengths: list,
+    success: list | None = None,
+    sustained: list | None = None,
+    time_up_frac: list | None = None,
+) -> None:
     if not rewards:
         print(f"  step {step:5d} | no completed episodes yet")
         return
     import statistics
-    print(
+    line = (
         f"  step {step:5d} | episodes: {len(rewards):4d} | "
         f"reward  mean={statistics.mean(rewards):7.2f}  "
         f"std={statistics.stdev(rewards) if len(rewards) > 1 else 0.0:6.2f}  "
         f"min={min(rewards):7.2f}  max={max(rewards):7.2f} | "
         f"length mean={statistics.mean(lengths):6.1f}"
     )
+    if success is not None and len(success) > 0:
+        n = len(success)
+        line += (
+            f"\n           survival(end)={sum(success)/n*100:5.2f}%  "
+            f"survival(sustained)={sum(sustained)/n*100:5.2f}%  "
+            f"time-upright={sum(time_up_frac)/n*100:5.2f}%"
+        )
+    print(line)
 
 
 def _make_video_recorder_cfg(video_dir: str):

@@ -17,7 +17,7 @@ from sensors.tactile import contact_forces_binary
 class ObservationsCfg:
     """Proprioception-only observation group for the recovery policy.
 
-    Layout (49 dims):
+    Layout (52 dims):
       0:4   contact state (4 feet)
       4:7   base linear velocity (body frame)
       7:10  base angular velocity (body frame)
